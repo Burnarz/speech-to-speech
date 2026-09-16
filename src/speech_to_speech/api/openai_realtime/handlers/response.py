@@ -37,10 +37,12 @@ from openai.types.realtime.response_content_part_added_event import Part as Adde
 from openai.types.realtime.response_content_part_done_event import Part as DoneContentPart
 
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
+from speech_to_speech.api.openai_realtime.protocol_events import ResponseFunctionCallArgumentsProgressEvent
 from speech_to_speech.LLM.chat import ChatItemError, add_supported_item
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
+    AssistantToolCallProgressEvent,
     AssistantToolCallReadyEvent,
     ResponseGenerationDoneEvent,
 )
@@ -143,6 +145,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.finished_function_call_indices = set()
         st.next_assistant_output_sequence = 0
         st.pending_early_tool_calls = {}
+        st.progress_tool_calls = {}
 
     @staticmethod
     def _prefetch_matches(event: ResponseCreateEvent) -> bool:
@@ -1048,18 +1051,31 @@ class ResponseHandler(RealtimeBaseHandler):
                 if not _early_tool_call or not wants_audio:
                     events.extend(self._finish_current_message_output(conn_id, event.response_key))
                 tool = part.tool
-                function_item_id = tool.id or _generate_id("item")
-                output_idx, function_item_id = self._output_part_context(
-                    conn_id,
-                    "tool_call",
-                    preferred_item_id=function_item_id,
-                )
+                # Streaming progress already reserved this call's identity so the
+                # client can correlate the in-block stream with the final item.
+                reserved = st.progress_tool_calls.pop(event.response_key or "", None)
+                if reserved is not None:
+                    function_item_id = reserved["item_id"]
+                    call_id = reserved["call_id"]
+                    output_idx = reserved["output_index"]
+                    st.current_output_index = output_idx
+                    st.current_output_kind = "tool_call"
+                    st.current_item_id = function_item_id
+                    st.content_index = 0
+                else:
+                    function_item_id = tool.id or _generate_id("item")
+                    output_idx, function_item_id = self._output_part_context(
+                        conn_id,
+                        "tool_call",
+                        preferred_item_id=function_item_id,
+                    )
+                    call_id = tool.call_id
                 st.response_usage.tool_calls += 1
                 pending_call = RealtimeConversationItemFunctionCall(
                     type="function_call",
                     object="realtime.item",
                     id=function_item_id,
-                    call_id=tool.call_id,
+                    call_id=call_id,
                     name=tool.name,
                     arguments=tool.arguments,
                     status=tool.status or "completed",
@@ -1077,7 +1093,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     ResponseFunctionCallArgumentsDoneEvent(
                         type="response.function_call_arguments.done",
                         event_id=self._next_event_id(),
-                        call_id=tool.call_id,
+                        call_id=call_id,
                         name=tool.name,
                         arguments=tool.arguments,
                         item_id=function_item_id,
@@ -1112,6 +1128,65 @@ class ResponseHandler(RealtimeBaseHandler):
                         wait_for_pending_reopen=wait_for_pending_reopen,
                     )
                 )
+        return events
+
+    def on_assistant_tool_call_progress(
+        self,
+        conn_id: str,
+        event: AssistantToolCallProgressEvent,
+    ) -> list[ServerEvent]:
+        """Stream an in-progress tool call before its block is complete.
+
+        The first progress event for a response reserves the function-call
+        item's identity (output index, item id, call id) so the later
+        ``output_item.added`` / ``arguments.done`` pair emitted by
+        ``on_assistant_output`` reuses exactly the same ids.
+        """
+        st = self._state(conn_id)
+        response_was_missing = st.current_response_id is None
+        resp_id, _ = self._ensure_response(conn_id, event.response_key)
+        events: list[ServerEvent] = []
+        if response_was_missing:
+            events.append(
+                ResponseCreatedEvent(
+                    type="response.created",
+                    event_id=self._next_event_id(),
+                    response=self._build_response(conn_id, "in_progress"),
+                )
+            )
+        self._service._apply_pending_token_usage(conn_id, event.response_key)
+        key = event.response_key or ""
+        rec = st.progress_tool_calls.get(key)
+        if rec is None:
+            # A tool call always owns its own item, matching the final
+            # ``on_assistant_output`` path (which never reuses the message item).
+            output_idx = st.next_output_index
+            st.next_output_index += 1
+            item_id = self._start_item(conn_id)
+            st.current_output_index = output_idx
+            st.current_output_kind = "tool_call"
+            rec = {
+                "output_index": output_idx,
+                "item_id": item_id,
+                "call_id": _generate_id("call"),
+                "name": event.name,
+            }
+            st.progress_tool_calls[key] = rec
+            while len(st.progress_tool_calls) > 16:
+                st.progress_tool_calls.pop(next(iter(st.progress_tool_calls)))
+        elif event.name and rec.get("name") is None:
+            rec["name"] = event.name
+        events.append(
+            ResponseFunctionCallArgumentsProgressEvent(
+                event_id=self._next_event_id(),
+                item_id=rec["item_id"],
+                call_id=rec["call_id"],
+                name=rec.get("name"),
+                output_index=rec["output_index"],
+                response_id=resp_id,
+                delta=event.delta,
+            )
+        )
         return events
 
     def on_assistant_tool_call_ready(

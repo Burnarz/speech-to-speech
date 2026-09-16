@@ -53,11 +53,13 @@ from speech_to_speech.api.openai_realtime.handlers import (
     SessionHandler,
 )
 from speech_to_speech.api.openai_realtime.input_state import InputItemState
+from speech_to_speech.api.openai_realtime.protocol_events import ResponseFunctionCallArgumentsProgressEvent
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
+    AssistantToolCallProgressEvent,
     AssistantToolCallReadyEvent,
     AudioInputCompletedEvent,
     PartialTranscriptionEvent,
@@ -127,6 +129,7 @@ ServerEvent = Union[
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseFunctionCallArgumentsDoneEvent,
+    ResponseFunctionCallArgumentsProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
     ResponseTextDeltaEvent,
@@ -230,6 +233,9 @@ class ConnState(BaseModel):
     # events only finalize audio.
     next_assistant_output_sequence: int = 0
     pending_early_tool_calls: dict[int, Any] = Field(default_factory=dict)
+    # Streaming progress reserved a tool call's item identity, keyed by
+    # response key. Consumed when the completed call is finally emitted.
+    progress_tool_calls: dict[str, dict[str, Any]] = Field(default_factory=dict)
     response_usage: UsageMetrics = Field(default_factory=UsageMetrics)
     pending_token_usage: dict[str, tuple[int, int]] = Field(default_factory=dict)
     speculative_turn_id: Optional[str] = None
@@ -326,6 +332,7 @@ class RealtimeService:
             AudioInputCompletedEvent: self._on_audio_input_completed,
             ResponseGenerationDoneEvent: self.response.on_response_generation_done,
             AssistantToolCallReadyEvent: self.response.on_assistant_tool_call_ready,
+            AssistantToolCallProgressEvent: self.response.on_assistant_tool_call_progress,
             ResponseFailedEvent: self._on_response_failed,
         }
 
@@ -480,6 +487,7 @@ class RealtimeService:
             # response after that queued generation is cancelled.
             st.next_assistant_output_sequence = 0
             st.pending_early_tool_calls.clear()
+            st.progress_tool_calls.clear()
         st.response_pending = bool(st.pending_response_keys)
 
     def close_response_key(self, conn_id: str, response_key: str | None) -> None:
@@ -521,6 +529,7 @@ class RealtimeService:
                 AssistantOutputEvent,
                 AssistantResponseDoneEvent,
                 AssistantToolCallReadyEvent,
+                AssistantToolCallProgressEvent,
                 ResponseGenerationDoneEvent,
             ),
         ):
@@ -542,7 +551,7 @@ class RealtimeService:
         if isinstance(event, TokenUsageEvent):
             return self._on_token_usage(conn_id, event)
 
-        if isinstance(event, (AssistantOutputEvent, AssistantToolCallReadyEvent)):
+        if isinstance(event, (AssistantOutputEvent, AssistantToolCallReadyEvent, AssistantToolCallProgressEvent)):
             # A TTS failure can overtake assistant content that the LLM already
             # queued for the same response. Do not publish text or tools after
             # that response has been marked failed.
@@ -595,6 +604,7 @@ class RealtimeService:
                 AssistantOutputEvent,
                 AssistantResponseDoneEvent,
                 AssistantToolCallReadyEvent,
+                AssistantToolCallProgressEvent,
                 ResponseGenerationDoneEvent,
             ),
         ):
@@ -607,6 +617,7 @@ class RealtimeService:
                 AssistantOutputEvent,
                 AssistantResponseDoneEvent,
                 AssistantToolCallReadyEvent,
+                AssistantToolCallProgressEvent,
                 ResponseGenerationDoneEvent,
             ),
         ):
