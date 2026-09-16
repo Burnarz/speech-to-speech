@@ -11,7 +11,9 @@ from openai.types.realtime.realtime_conversation_item_assistant_message import (
 )
 from openai.types.responses import (
     ResponseCompletedEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionToolCall,
+    ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseTextDeltaEvent,
@@ -24,6 +26,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     ProviderEvent,
     TextDelta,
     ToolCall,
+    ToolCallProgress,
     Usage,
 )
 from speech_to_speech.LLM.chat import Chat
@@ -176,14 +179,48 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
         ]
 
     def _iter_stream_events(self, api_response: Stream) -> Iterator[ProviderEvent]:
+        # Function-call items are keyed by the provider's item id so one
+        # normalized identity (call id, item id, name) is assigned at first
+        # sight and reused by the argument deltas and the final done event —
+        # stable from first byte to the chat record.
+        fc_context: dict[str, tuple[str, str, str | None]] = {}
+
+        def _normalize_fc(item: ResponseFunctionToolCall) -> None:
+            stored = fc_context.get(item.id or "")
+            if stored is None:
+                stored = (_generate_id("call"), _generate_id("fc"), item.name)
+                if item.id:
+                    fc_context[item.id] = stored
+            item.call_id = stored[0]
+            item.id = stored[1]
+
         for raw_event in api_response:
             if isinstance(raw_event, ResponseTextDeltaEvent):
                 yield TextDelta(text=raw_event.delta)
+            elif isinstance(raw_event, ResponseOutputItemAddedEvent):
+                item = raw_event.item
+                if isinstance(item, ResponseFunctionToolCall):
+                    _normalize_fc(item)
+            elif isinstance(raw_event, ResponseFunctionCallArgumentsDeltaEvent):
+                if not raw_event.delta:
+                    continue
+                stored = fc_context.get(raw_event.item_id or "")
+                if stored is None:
+                    # Provider without an added event: mint the identity on
+                    # the first delta and keep it until the done event.
+                    stored = (_generate_id("call"), _generate_id("fc"), None)
+                    if raw_event.item_id:
+                        fc_context[raw_event.item_id] = stored
+                yield ToolCallProgress(
+                    name=stored[2],
+                    item_id=stored[1],
+                    call_id=stored[0],
+                    delta=raw_event.delta,
+                )
             elif isinstance(raw_event, ResponseOutputItemDoneEvent):
                 item = raw_event.item
                 if isinstance(item, ResponseFunctionToolCall):
-                    item.call_id = _generate_id("call")
-                    item.id = _generate_id("fc")
+                    _normalize_fc(item)
                     yield ToolCall(item=item)
                 elif isinstance(item, ResponseOutputMessage):
                     yield AssistantMessage(content=self._assistant_content(item.content))

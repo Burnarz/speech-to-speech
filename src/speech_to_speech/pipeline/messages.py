@@ -111,11 +111,15 @@ class AssistantToolCallProgressPart(BaseModel):
 
     ``delta`` carries the raw in-block text (delimiters excluded) since the
     previous progress part.  It is side-channel only: it never reaches TTS,
-    chat history, or the ordered assistant-output path.
+    chat history, or the ordered assistant-output path.  When the provider
+    streams item identity (``item_id`` / ``call_id``), the part carries it so
+    the realtime events and the chat record stay correlated.
     """
 
     type: Literal["tool_call_progress"] = "tool_call_progress"
     name: str | None = None
+    item_id: str | None = None
+    call_id: str | None = None
     delta: str = ""
 
 

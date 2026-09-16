@@ -50,6 +50,7 @@ from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import (
+    AssistantToolCallProgressPart,
     EndOfResponse,
     LLMResponseChunk,
     ResponsePrefetchTransaction,
@@ -94,6 +95,20 @@ class ToolCall(BaseModel):
     item: ResponseFunctionToolCall
 
 
+class ToolCallProgress(BaseModel):
+    """A streamed delta of an in-progress function call's arguments.
+
+    Side-channel only: never recorded to chat and never sent to TTS.  When
+    the provider streams item identity, it rides along (``item_id`` /
+    ``call_id``) so the realtime events and the chat record stay correlated.
+    """
+
+    name: str | None = None
+    item_id: str | None = None
+    call_id: str | None = None
+    delta: str = ""
+
+
 class Usage(BaseModel):
     """Token accounting for the turn."""
 
@@ -101,7 +116,7 @@ class Usage(BaseModel):
     output_tokens: int
 
 
-ProviderEvent = TextDelta | AssistantMessage | ToolCall | Usage
+ProviderEvent = TextDelta | AssistantMessage | ToolCall | ToolCallProgress | Usage
 SerializeFn = Callable[[Chat], Any]
 RequestFn = Callable[[Any, dict[str, Any]], Any]
 EventIteratorFn = Callable[[Any], Iterator[ProviderEvent]]
@@ -621,6 +636,19 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 state.pending.append(
                     RealtimeConversationItemAssistantMessage(type="message", role="assistant", content=event.content)
                 )
+                # The message item is complete, so its spoken text is final:
+                # flush now instead of holding a lone short message until the
+                # tool call or the stream end.
+                if printable_text.strip():
+                    sentence_batch.append(remove_markdown(printable_text.strip()))
+                    printable_text = ""
+                if sentence_batch:
+                    if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                        logger.info("LLM generation cancelled (stale speculative turn)")
+                        cancelled = True
+                        break
+                    yield from _flush(sentence_batch)
+                    sentence_batch = []
             elif isinstance(event, ToolCall):
                 # Flush any pending spoken text before emitting the tool call.
                 if printable_text.strip():
@@ -634,6 +662,29 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     yield from _flush(sentence_batch)
                     sentence_batch = []
                 yield from self._record_tool_call(state, turn, event.item)
+            elif isinstance(event, ToolCallProgress):
+                # Side-channel only: stream the in-progress arguments to the
+                # client (panel rendering) without touching TTS, chat history,
+                # or the ordered output path.
+                if event.delta and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                    yield LLMResponseChunk(
+                        parts=[
+                            AssistantToolCallProgressPart(
+                                name=event.name,
+                                item_id=event.item_id,
+                                call_id=event.call_id,
+                                delta=event.delta,
+                            )
+                        ],
+                        language_code=turn.language_code,
+                        runtime_config=turn.runtime_config,
+                        response=turn.response,
+                        turn_id=turn.turn_id,
+                        turn_revision=turn.turn_revision,
+                        speech_stopped_at_s=turn.speech_stopped_at_s,
+                        cancel_generation=turn.gen,
+                        response_key=turn.response_key,
+                    )
             elif isinstance(event, TextDelta):
                 if not turn.wants_audio:
                     # Text-only: forward verbatim. Keep every character (no

@@ -1055,8 +1055,15 @@ class ResponseHandler(RealtimeBaseHandler):
                 # client can correlate the in-block stream with the final item.
                 reserved = st.progress_tool_calls.pop(event.response_key or "", None)
                 if reserved is not None:
-                    function_item_id = reserved["item_id"]
-                    call_id = reserved["call_id"]
+                    if reserved.get("explicit_ids") and tool.id and tool.call_id:
+                        # The LLM layer owns the identity: the progress stream
+                        # and the chat record share it, so the reservation only
+                        # pinned the output slot.
+                        function_item_id = tool.id
+                        call_id = tool.call_id
+                    else:
+                        function_item_id = reserved["item_id"]
+                        call_id = reserved["call_id"]
                     output_idx = reserved["output_index"]
                     st.current_output_index = output_idx
                     st.current_output_kind = "tool_call"
@@ -1140,7 +1147,10 @@ class ResponseHandler(RealtimeBaseHandler):
         The first progress event for a response reserves the function-call
         item's identity (output index, item id, call id) so the later
         ``output_item.added`` / ``arguments.done`` pair emitted by
-        ``on_assistant_output`` reuses exactly the same ids.
+        ``on_assistant_output`` reuses exactly the same ids.  When the event
+        already carries a provider-streamed identity, it is reused verbatim
+        (the chat record was written with those same ids); otherwise the
+        reservation invents one.
         """
         st = self._state(conn_id)
         response_was_missing = st.current_response_id is None
@@ -1162,15 +1172,27 @@ class ResponseHandler(RealtimeBaseHandler):
             # ``on_assistant_output`` path (which never reuses the message item).
             output_idx = st.next_output_index
             st.next_output_index += 1
-            item_id = self._start_item(conn_id)
             st.current_output_index = output_idx
             st.current_output_kind = "tool_call"
-            rec = {
-                "output_index": output_idx,
-                "item_id": item_id,
-                "call_id": _generate_id("call"),
-                "name": event.name,
-            }
+            if event.item_id and event.call_id:
+                st.current_item_id = event.item_id
+                st.content_index = 0
+                rec = {
+                    "output_index": output_idx,
+                    "item_id": event.item_id,
+                    "call_id": event.call_id,
+                    "name": event.name,
+                    "explicit_ids": True,
+                }
+            else:
+                item_id = self._start_item(conn_id)
+                rec = {
+                    "output_index": output_idx,
+                    "item_id": item_id,
+                    "call_id": _generate_id("call"),
+                    "name": event.name,
+                    "explicit_ids": False,
+                }
             st.progress_tool_calls[key] = rec
             while len(st.progress_tool_calls) > 16:
                 st.progress_tool_calls.pop(next(iter(st.progress_tool_calls)))

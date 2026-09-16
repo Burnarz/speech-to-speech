@@ -46,14 +46,25 @@ def _progress(delta: str, *, name: str | None = None) -> AssistantToolCallProgre
     )
 
 
-def _tool(call_id: str) -> AssistantToolCallPart:
-    return AssistantToolCallPart(
-        tool={
-            "type": "function_call",
-            "call_id": call_id,
-            "name": "show_document",
-            "arguments": '{"title": "T", "content": "C"}',
-        }
+def _tool(call_id: str, item_id: str | None = None) -> AssistantToolCallPart:
+    tool: dict[str, Any] = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": "show_document",
+        "arguments": '{"title": "T", "content": "C"}',
+    }
+    if item_id is not None:
+        tool["id"] = item_id
+    return AssistantToolCallPart(tool=tool)
+
+
+def _progress_with_ids(delta: str, *, name: str | None = None, item_id: str = "item_prog", call_id: str = "call_prog"):
+    return AssistantToolCallProgressEvent(
+        response_key=_RESPONSE_KEY,
+        name=name,
+        item_id=item_id,
+        call_id=call_id,
+        delta=delta,
     )
 
 
@@ -116,6 +127,50 @@ def test_progress_streams_and_final_item_reuses_reserved_identity(service, conn_
     assert args_done.item_id == added.item.id
     assert args_done.call_id == added.item.call_id
     assert args_done.output_index == added.output_index
+
+    done = next(event for event in standard if event.type == "response.done")
+    assert all(event.response_id == done.response.id for event in progress)
+
+    assert_openai_schema(standard)
+    assert_response_lifecycle_contract(standard, wants_audio=False, expected_status="completed")
+
+
+def test_progress_with_explicit_ids_reuses_them_on_final_item(service, conn_id):
+    """Provider-streamed identity: progress and final item share the same ids.
+
+    This keeps a client ``function_call_output`` (echoing the client-visible
+    call id) matchable against the chat record, which was written with the
+    same ids by the LLM layer.
+    """
+    _open_response(service, conn_id)
+
+    events: list[Any] = []
+    events += service.dispatch_pipeline_event(conn_id, _progress_with_ids('{"tit', name="show_document"))
+    events += service.dispatch_pipeline_event(
+        conn_id,
+        AssistantOutputEvent(
+            response_key=_RESPONSE_KEY,
+            output_sequence=0,
+            parts=[_tool("call_prog", item_id="item_prog")],
+        ),
+    )
+    events += service.finish_response(conn_id, status="completed")
+
+    progress, standard = _split(events)
+    assert [event.delta for event in progress] == ['{"tit']
+
+    added = next(event for event in standard if event.type == "response.output_item.added")
+    assert added.item.type == "function_call"
+    assert added.item.id == "item_prog"
+    assert added.item.call_id == "call_prog"
+    for event in progress:
+        assert event.item_id == "item_prog"
+        assert event.call_id == "call_prog"
+        assert event.output_index == added.output_index
+
+    args_done = next(event for event in standard if event.type == "response.function_call_arguments.done")
+    assert args_done.item_id == "item_prog"
+    assert args_done.call_id == "call_prog"
 
     done = next(event for event in standard if event.type == "response.done")
     assert all(event.response_id == done.response.id for event in progress)

@@ -187,6 +187,8 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
                     self.text_output_queue.put(
                         AssistantToolCallProgressEvent(
                             name=part.name,
+                            item_id=part.item_id,
+                            call_id=part.call_id,
                             delta=part.delta,
                             turn_id=lm_output.turn_id,
                             turn_revision=lm_output.turn_revision,

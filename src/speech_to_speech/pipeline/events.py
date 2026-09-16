@@ -162,6 +162,8 @@ class AssistantToolCallProgressEvent(PipelineEvent):
 
     type: Literal["assistant_tool_call_progress"] = "assistant_tool_call_progress"
     name: str | None = None
+    item_id: str | None = None
+    call_id: str | None = None
     delta: str = ""
     turn_id: str | None = None
     turn_revision: int | None = None

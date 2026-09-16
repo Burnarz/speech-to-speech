@@ -17,7 +17,9 @@ from openai.types.realtime.conversation_item import (
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 from openai.types.responses import (
     Response,
+    ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionToolCall,
+    ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseTextDeltaEvent,
@@ -35,6 +37,7 @@ from speech_to_speech.LLM.chat import (
 from speech_to_speech.LLM.responses_api_language_model import ResponsesApiModelHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.messages import (
+    AssistantToolCallProgressPart,
     EndOfResponse,
     GenerateResponseRequest,
     LLMResponseChunk,
@@ -73,17 +76,59 @@ def _make_stream(events):
     return stream
 
 
-def _make_function_call_done_event(name="camera", arguments="{}"):
+def _make_function_call_done_event(name="camera", arguments="{}", item_id=None):
     return ResponseOutputItemDoneEvent(
         type="response.output_item.done",
         output_index=1,
         sequence_number=2,
         item=ResponseFunctionToolCall(
             type="function_call",
+            id=item_id,
             call_id="call_original",
             name=name,
             arguments=arguments,
         ),
+    )
+
+
+def _make_message_done_event(text, output_index=0, sequence_number=0):
+    return ResponseOutputItemDoneEvent(
+        type="response.output_item.done",
+        output_index=output_index,
+        sequence_number=sequence_number,
+        item=ResponseOutputMessage(
+            type="message",
+            role="assistant",
+            status="completed",
+            id="msg_1",
+            content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+        ),
+    )
+
+
+def _make_function_call_added_event(name="show_document", item_id="fc_1"):
+    return ResponseOutputItemAddedEvent(
+        type="response.output_item.added",
+        output_index=1,
+        sequence_number=0,
+        item=ResponseFunctionToolCall(
+            type="function_call",
+            id=item_id,
+            call_id="call_original",
+            name=name,
+            arguments="",
+            status="in_progress",
+        ),
+    )
+
+
+def _make_function_call_arguments_delta_event(delta, item_id="fc_1"):
+    return ResponseFunctionCallArgumentsDeltaEvent(
+        type="response.function_call_arguments.delta",
+        output_index=1,
+        sequence_number=1,
+        item_id=item_id,
+        delta=delta,
     )
 
 
@@ -662,6 +707,79 @@ def test_process_preserves_streamed_text_after_function_call_order():
     assert outputs[2].text == "This may take a second."
     assert outputs[2].tools == []
     assert isinstance(outputs[3], EndOfResponse)
+
+
+def test_streaming_function_call_progress_side_channel_with_stable_ids():
+    handler = _make_handler()
+
+    streamed_events = [
+        _make_function_call_added_event(name="show_document", item_id="fc_1"),
+        _make_function_call_arguments_delta_event(delta='{"title": "Rec', item_id="fc_1"),
+        _make_function_call_arguments_delta_event(delta='ette", "content": "x"}', item_id="fc_1"),
+        _make_function_call_done_event(name="show_document", arguments='{"title": "Recette"}', item_id="fc_1"),
+    ]
+
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(streamed_events),
+        )
+    )
+
+    outputs = list(handler.process(_make_request("montre moi une recette")))
+
+    chunks = [output for output in outputs if isinstance(output, LLMResponseChunk)]
+    progress_parts = [
+        part for chunk in chunks for part in chunk.parts if isinstance(part, AssistantToolCallProgressPart)
+    ]
+    assert [part.delta for part in progress_parts] == ['{"title": "Rec', 'ette", "content": "x"}']
+    assert all(part.name == "show_document" for part in progress_parts)
+    # No progress part may leak into spoken text or recorded tools.
+    assert all(not chunk.text for chunk in chunks)
+
+    tool_chunks = [chunk for chunk in chunks if chunk.tools]
+    assert len(tool_chunks) == 1
+    tool = tool_chunks[0].tools[0]
+    # One normalized identity shared by every progress delta and the final
+    # (chat-recorded) tool call — never the provider's raw id.
+    for part in progress_parts:
+        assert part.item_id == tool.id
+        assert part.call_id == tool.call_id
+    assert tool.id != "fc_1"
+    assert tool.call_id != "call_original"
+
+
+def test_single_sentence_message_flushes_before_tool_progress_streaming():
+    handler = _make_handler()
+    handler.stream_batch_sentences = 3
+
+    streamed_events = [
+        _make_text_delta_event("Je vous sors la recette."),
+        _make_message_done_event("Je vous sors la recette."),
+        _make_function_call_added_event(name="show_document", item_id="fc_1"),
+        _make_function_call_arguments_delta_event(delta='{"ti', item_id="fc_1"),
+        _make_function_call_done_event(name="show_document", arguments='{"title": "T"}', item_id="fc_1"),
+    ]
+
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(streamed_events),
+        )
+    )
+
+    outputs = list(handler.process(_make_request("montre moi une recette")))
+
+    chunks = [output for output in outputs if isinstance(output, LLMResponseChunk)]
+    # The lone sentence is spoken as soon as its message item completes,
+    # before the tool-call stream even starts.
+    assert chunks[0].text == "Je vous sors la recette."
+    progress_parts = [
+        part for chunk in chunks for part in chunk.parts if isinstance(part, AssistantToolCallProgressPart)
+    ]
+    assert [part.delta for part in progress_parts] == ['{"ti']
+    tool_chunks = [chunk for chunk in chunks if chunk.tools]
+    assert len(tool_chunks) == 1
+    assert progress_parts[0].item_id == tool_chunks[0].tools[0].id
+    assert progress_parts[0].call_id == tool_chunks[0].tools[0].call_id
 
 
 def test_audio_streaming_preserves_provider_whitespace_across_chunks():
