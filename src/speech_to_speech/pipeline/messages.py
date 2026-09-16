@@ -106,8 +106,21 @@ class AssistantToolCallPart(BaseModel):
     tool: ResponseFunctionToolCall
 
 
+class AssistantToolCallProgressPart(BaseModel):
+    """Incremental progress of a tool call whose block is still streaming.
+
+    ``delta`` carries the raw in-block text (delimiters excluded) since the
+    previous progress part.  It is side-channel only: it never reaches TTS,
+    chat history, or the ordered assistant-output path.
+    """
+
+    type: Literal["tool_call_progress"] = "tool_call_progress"
+    name: str | None = None
+    delta: str = ""
+
+
 AssistantOutputPart: TypeAlias = Annotated[
-    AssistantTextPart | AssistantToolCallPart,
+    AssistantTextPart | AssistantToolCallPart | AssistantToolCallProgressPart,
     Field(discriminator="type"),
 ]
 

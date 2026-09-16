@@ -17,6 +17,7 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
+    AssistantToolCallProgressEvent,
     AssistantToolCallReadyEvent,
     PipelineEvent,
     ResponseFailedEvent,
@@ -27,6 +28,7 @@ from speech_to_speech.pipeline.handler_types import LLMOut, TTSIn
 from speech_to_speech.pipeline.messages import (
     AssistantTextPart,
     AssistantToolCallPart,
+    AssistantToolCallProgressPart,
     EndOfResponse,
     LLMResponseChunk,
     TokenUsage,
@@ -178,6 +180,21 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
         response_key = self._start_response(lm_output.response_key)
 
         for part in lm_output.parts:
+            if isinstance(part, AssistantToolCallProgressPart):
+                # Side-channel only: streams to the realtime client without
+                # touching the ordered TTS path or chat history.
+                if self.text_output_queue is not None:
+                    self.text_output_queue.put(
+                        AssistantToolCallProgressEvent(
+                            name=part.name,
+                            delta=part.delta,
+                            turn_id=lm_output.turn_id,
+                            turn_revision=lm_output.turn_revision,
+                            cancel_generation=lm_output.cancel_generation,
+                            response_key=response_key,
+                        )
+                    )
+                continue
             output_sequence = self._output_sequence
             self._output_sequence += 1
             if isinstance(part, AssistantToolCallPart) and part.tool.call_id not in self._tool_call_ids:

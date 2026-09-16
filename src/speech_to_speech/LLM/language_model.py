@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sized
 from queue import Empty
@@ -61,6 +62,7 @@ from speech_to_speech.pipeline.messages import (
     AssistantOutputPart,
     AssistantTextPart,
     AssistantToolCallPart,
+    AssistantToolCallProgressPart,
     EndOfResponse,
     GenerateResponseRequest,
     LLMResponseChunk,
@@ -92,6 +94,10 @@ except ImportError:
     HAS_MLX_VLM = False
 
 logger = logging.getLogger(__name__)
+
+# Minimum growth of an open tool-call block before another progress chunk is
+# streamed, keeping the side-channel rate bounded while the block is open.
+TOOL_CALL_PROGRESS_MIN_CHARS = 32
 
 
 @runtime_checkable
@@ -145,6 +151,8 @@ class StreamContext(BaseModel):
     end_code: Optional[str] = None
     input_tokens: int = 0
     sentence_batch: list[str] = Field(default_factory=list)
+    # Length of the open tool-call block already streamed as progress parts.
+    tool_call_progress_sent: int = 0
     turn_id: str | None = None
     turn_revision: int | None = None
     speech_stopped_at_s: float | None = None
@@ -313,6 +321,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             ctx.enter_code = enter_code
             ctx.end_code = end_code
 
+    @staticmethod
+    def _tool_call_block_name(inner: str) -> Optional[str]:
+        """Best-effort function name from an open tool-call block."""
+        match = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", inner)
+        return match.group(1) if match else None
+
     def _process_printable_text(
         self,
         printable_text: str,
@@ -360,11 +374,36 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 ctx.sentence_batch = []
             if not ctx.block_regex or not ctx.end_code or ctx.end_code not in code_and_after:
                 # Preserve the incomplete block until more streamed text arrives.
+                # Stream the growing block on the side channel so document-style
+                # tools can render before the call is complete and parseable.
+                inner = code_and_after[len(ctx.enter_code):]
+                if inner:
+                    prev = ctx.tool_call_progress_sent
+                    if prev == 0 or len(inner) - prev >= TOOL_CALL_PROGRESS_MIN_CHARS:
+                        ctx.tool_call_progress_sent = len(inner)
+                        chunks.append(
+                            LLMResponseChunk(
+                                parts=[
+                                    AssistantToolCallProgressPart(
+                                        name=self._tool_call_block_name(inner),
+                                        delta=inner[prev:],
+                                    )
+                                ],
+                                language_code=language_code,
+                                runtime_config=runtime_config,
+                                response=response,
+                                turn_id=ctx.turn_id,
+                                turn_revision=ctx.turn_revision,
+                                speech_stopped_at_s=ctx.speech_stopped_at_s,
+                                cancel_generation=ctx.cancel_generation,
+                            )
+                        )
                 return chunks, tools, code_and_after
 
             block_end = code_and_after.index(ctx.end_code) + len(ctx.end_code)
             complete_block = code_and_after[:block_end]
             printable_text = code_and_after[block_end:]
+            ctx.tool_call_progress_sent = 0
             _, func_calls = extract_function_calls_from_text(complete_block, ctx.block_regex)
             parsed_tools: list[ResponseFunctionToolCall] = []
             for fc in func_calls:

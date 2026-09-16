@@ -152,6 +152,23 @@ class AssistantToolCallReadyEvent(PipelineEvent):
     response_key: str | None = Field(default=None, exclude=True, repr=False)
 
 
+class AssistantToolCallProgressEvent(PipelineEvent):
+    """Streaming progress of a tool call whose block is still being generated.
+
+    Side-channel only: it never reaches TTS or the ordered assistant-output
+    path.  The realtime handler turns it into an incremental client event so
+    document-style tools can render before the call is complete and parseable.
+    """
+
+    type: Literal["assistant_tool_call_progress"] = "assistant_tool_call_progress"
+    name: str | None = None
+    delta: str = ""
+    turn_id: str | None = None
+    turn_revision: int | None = None
+    cancel_generation: int | None = None
+    response_key: str | None = Field(default=None, exclude=True, repr=False)
+
+
 class TokenUsageEvent(PipelineEvent):
     type: Literal["token_usage"] = "token_usage"
     input_tokens: int = 0
