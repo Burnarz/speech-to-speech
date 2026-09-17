@@ -109,6 +109,15 @@ class ToolCallProgress(BaseModel):
     delta: str = ""
 
 
+class ToolCallStarted(BaseModel):
+    """The provider began streaming a function-call item.
+
+    Cue for the consumer to release any pending spoken lead-in text before
+    the (possibly long) argument stream starts, instead of holding it until
+    the item completes.  Carries no identity of its own: the deltas and the
+    done event own the correlation."""
+
+
 class Usage(BaseModel):
     """Token accounting for the turn."""
 
@@ -116,7 +125,7 @@ class Usage(BaseModel):
     output_tokens: int
 
 
-ProviderEvent = TextDelta | AssistantMessage | ToolCall | ToolCallProgress | Usage
+ProviderEvent = TextDelta | AssistantMessage | ToolCall | ToolCallStarted | ToolCallProgress | Usage
 SerializeFn = Callable[[Chat], Any]
 RequestFn = Callable[[Any, dict[str, Any]], Any]
 EventIteratorFn = Callable[[Any], Iterator[ProviderEvent]]
@@ -620,6 +629,20 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             state.output_emitted = True
             yield self._chunk(turn, text=" ".join(batch))
 
+        def _flush_pending() -> Iterator[LLMOut]:
+            nonlocal printable_text, sentence_batch, cancelled
+            if printable_text.strip():
+                sentence_batch.append(remove_markdown(printable_text.strip()))
+                printable_text = ""
+            if not sentence_batch:
+                return
+            if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                logger.info("LLM generation cancelled (stale speculative turn)")
+                cancelled = True
+                return
+            yield from _flush(sentence_batch)
+            sentence_batch = []
+
         for event in events:
             # Provider usage is billable even when cancellation rolls back the
             # assistant output that accompanied it.
@@ -639,28 +662,22 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # The message item is complete, so its spoken text is final:
                 # flush now instead of holding a lone short message until the
                 # tool call or the stream end.
-                if printable_text.strip():
-                    sentence_batch.append(remove_markdown(printable_text.strip()))
-                    printable_text = ""
-                if sentence_batch:
-                    if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
-                        logger.info("LLM generation cancelled (stale speculative turn)")
-                        cancelled = True
-                        break
-                    yield from _flush(sentence_batch)
-                    sentence_batch = []
+                yield from _flush_pending()
+                if cancelled:
+                    break
+            elif isinstance(event, ToolCallStarted):
+                # The provider began a tool call: release the lead-in text now
+                # so it is spoken while the arguments stream, instead of after
+                # the whole response completes (providers like llama.cpp only
+                # deliver item-done frames in a final batch, far too late).
+                yield from _flush_pending()
+                if cancelled:
+                    break
             elif isinstance(event, ToolCall):
                 # Flush any pending spoken text before emitting the tool call.
-                if printable_text.strip():
-                    sentence_batch.append(remove_markdown(printable_text.strip()))
-                    printable_text = ""
-                if sentence_batch:
-                    if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
-                        logger.info("LLM generation cancelled (stale speculative turn)")
-                        cancelled = True
-                        break
-                    yield from _flush(sentence_batch)
-                    sentence_batch = []
+                yield from _flush_pending()
+                if cancelled:
+                    break
                 yield from self._record_tool_call(state, turn, event.item)
             elif isinstance(event, ToolCallProgress):
                 # Side-channel only: stream the in-progress arguments to the

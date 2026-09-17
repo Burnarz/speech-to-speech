@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Literal, cast
 
 from openai.types.realtime import (
@@ -201,9 +202,10 @@ class ResponseHandler(RealtimeBaseHandler):
         )
         st.tool_followup_prefetch_request = request
         st.tool_followup_prefetch_origin_response_key = origin_response_key
+        st.tool_followup_prefetch_started_at = time.monotonic()
         st.mark_response_pending(request.response_key)
         queue.put(request)
-        logger.debug("Started internal tool follow-up prefetch")
+        logger.info("Tool follow-up prefetch started (origin response %s)", origin_response_key)
         return True
 
     def discard_tool_followup_prefetch(
@@ -245,9 +247,11 @@ class ResponseHandler(RealtimeBaseHandler):
         st.completed_tool_response_keys.pop(request.response_key, None)
         st.tool_followup_prefetch_request = None
         st.tool_followup_prefetch_origin_response_key = None
+        st.tool_followup_prefetch_started_at = None
         if origin_response_key is not None:
             st.generation_done_tool_calls.pop(origin_response_key, None)
             st.completed_tool_response_keys.pop(origin_response_key, None)
+        logger.info("Tool follow-up prefetch discarded (response %s)", request.response_key)
 
     def _claim_tool_followup_prefetch(
         self,
@@ -284,6 +288,7 @@ class ResponseHandler(RealtimeBaseHandler):
         origin_response_key = st.tool_followup_prefetch_origin_response_key
         st.tool_followup_prefetch_request = None
         st.tool_followup_prefetch_origin_response_key = None
+        st.tool_followup_prefetch_started_at = None
         if origin_response_key is not None:
             st.generation_done_tool_calls.pop(origin_response_key, None)
             st.completed_tool_response_keys.pop(origin_response_key, None)
@@ -294,7 +299,7 @@ class ResponseHandler(RealtimeBaseHandler):
         st.current_response_key = request.response_key
         st.response_created_pending_key = request.response_key
         self._start_item(conn_id)
-        logger.debug("Standard response.create claimed internal tool follow-up prefetch")
+        logger.info("Standard response.create claimed tool follow-up prefetch")
         return ResponseCreatedEvent(
             type="response.created",
             event_id=self._next_event_id(),
@@ -804,7 +809,7 @@ class ResponseHandler(RealtimeBaseHandler):
             # speculative-turn staleness gate treat them as always-latest, so a new user
             # turn mid-generation can never silently drop their output.
             queue.put(request)
-        logger.debug("response.create received, LLM generation triggered")
+        logger.info("response.create received, fresh LLM generation triggered")
         return ResponseCreatedEvent(
             type="response.created",
             event_id=self._next_event_id(),

@@ -6,6 +6,7 @@ validated for correct type, attributes, and state transitions.
 
 import base64
 import json
+import time
 from queue import Queue
 from threading import Event, Thread
 from time import sleep
@@ -51,6 +52,7 @@ from openai.types.realtime.conversation_item import (
 
 from speech_to_speech.api.openai_realtime.service import (
     CHUNK_SIZE_BYTES,
+    TOOL_FOLLOWUP_PREFETCH_EXPIRY_S,
     RealtimeService,
 )
 from speech_to_speech.pipeline.events import (
@@ -999,6 +1001,52 @@ class TestDeferConversationItemsDuringResponse:
         assert not chat.has_pending_tool_calls()
         next_response = service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
         assert isinstance(next_response, ResponseCreatedEvent)
+
+    def test_expire_tool_followup_prefetch_discards_stale_unclaimed(self, service, conn_id):
+        st = service._state(conn_id)
+        tx = ResponsePrefetchTransaction()
+        request = GenerateResponseRequest(runtime_config=st.runtime_config, prefetch_transaction=tx)
+        st.tool_followup_prefetch_request = request
+        st.tool_followup_prefetch_origin_response_key = "rk_origin"
+        st.tool_followup_prefetch_started_at = time.monotonic() - TOOL_FOLLOWUP_PREFETCH_EXPIRY_S - 1
+        st.generation_done_tool_calls["rk_origin"] = {"call_1"}
+        st.mark_response_pending(request.response_key)
+
+        assert service.expire_tool_followup_prefetch(conn_id) is True
+        assert st.tool_followup_prefetch_request is None
+        assert st.tool_followup_prefetch_origin_response_key is None
+        assert st.tool_followup_prefetch_started_at is None
+        # The speculative work is invalidated so any blocked consumer unblocks.
+        assert tx.discarded
+        # The prefetch key is tombstoned and no longer holds the response slot,
+        # so a late response.create falls through to fresh generation.
+        assert request.response_key in st.closed_response_keys
+        assert request.response_key not in st.pending_response_keys
+        assert st.response_pending is False
+        assert st.generation_done_tool_calls.get("rk_origin") is None
+
+    def test_expire_tool_followup_prefetch_noop_when_fresh_or_claimed(self, service, conn_id):
+        st = service._state(conn_id)
+        tx = ResponsePrefetchTransaction()
+        request = GenerateResponseRequest(runtime_config=st.runtime_config, prefetch_transaction=tx)
+        st.tool_followup_prefetch_request = request
+        st.tool_followup_prefetch_origin_response_key = "rk_origin"
+        st.tool_followup_prefetch_started_at = time.monotonic()
+
+        # Fresh: too young to expire.
+        assert service.expire_tool_followup_prefetch(conn_id) is False
+        assert st.tool_followup_prefetch_request is request
+        assert not tx.discarded
+
+        # Claimed: never expires, even when stale.
+        st.tool_followup_prefetch_started_at = time.monotonic() - TOOL_FOLLOWUP_PREFETCH_EXPIRY_S - 1
+        assert tx.claim() is True
+        assert service.expire_tool_followup_prefetch(conn_id) is False
+        assert st.tool_followup_prefetch_request is request
+        assert not tx.discarded
+
+    def test_expire_tool_followup_prefetch_noop_without_prefetch(self, service, conn_id):
+        assert service.expire_tool_followup_prefetch(conn_id) is False
 
 
 # ===================================================================

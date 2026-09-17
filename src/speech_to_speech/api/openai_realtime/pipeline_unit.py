@@ -74,3 +74,6 @@ class PipelineUnit(BaseModel):
     handlers: list[Any]
 
     session: Optional[SessionState] = None
+    # Monotonic time of the last tool-followup-prefetch expiry poll in the
+    # send loop (throttled so the check stays cheap while streaming).
+    prefetch_expiry_check_at: float = 0.0

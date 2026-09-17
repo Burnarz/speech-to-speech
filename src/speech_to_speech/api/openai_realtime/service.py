@@ -1,4 +1,5 @@
 import logging
+import time
 from collections.abc import Mapping
 from queue import Queue
 from threading import Event as ThreadingEvent
@@ -84,6 +85,10 @@ PIPELINE_SAMPLE_RATE = 16000
 CHUNK_SAMPLES = 512
 BYTES_PER_SAMPLE = 2
 CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+# A tool follow-up prefetch is speculative: the client must adopt it with a
+# standard response.create. If that never arrives within this grace period the
+# prefetch is discarded and listening re-enabled so the user is never stuck.
+TOOL_FOLLOWUP_PREFETCH_EXPIRY_S = 10.0
 
 _ResponseStatus = Literal["completed", "cancelled", "failed", "incomplete", "in_progress"]
 _StatusReason = Literal["turn_detected", "client_cancelled", "max_output_tokens", "content_filter"]
@@ -262,6 +267,10 @@ class ConnState(BaseModel):
     completed_tool_response_keys: dict[str, None] = Field(default_factory=dict)
     tool_followup_prefetch_request: GenerateResponseRequest | None = None
     tool_followup_prefetch_origin_response_key: str | None = None
+    # Monotonic start of the speculative request; an unclaimed prefetch older
+    # than TOOL_FOLLOWUP_PREFETCH_EXPIRY_S is discarded so a client that never
+    # sends response.create cannot hold the session (and the turn) forever.
+    tool_followup_prefetch_started_at: float | None = None
     # A client-triggered response is not visible until its response.created
     # frame has finished sending. Pipeline output is held behind this key so a
     # fast or already-buffered generation cannot overtake that lifecycle event.
@@ -498,6 +507,32 @@ class RealtimeService:
             self.total_usage.input_tokens += input_tokens
             self.total_usage.output_tokens += output_tokens
         st.close_response_key(response_key)
+
+    def expire_tool_followup_prefetch(self, conn_id: str) -> bool:
+        """Discard an unclaimed tool follow-up prefetch once it is too old.
+
+        Called from the connection loop on every idle poll, so it must stay
+        cheap in the common no-prefetch case.  A late response.create still
+        works afterwards: the handler falls back to fresh generation.
+        Returns whether a prefetch was expired (the caller re-enables
+        listening)."""
+        st = self._state(conn_id)
+        request = st.tool_followup_prefetch_request
+        started_at = st.tool_followup_prefetch_started_at
+        if request is None or started_at is None:
+            return False
+        if request.prefetch_transaction is not None and request.prefetch_transaction.claimed:
+            return False
+        age = time.monotonic() - started_at
+        if age < TOOL_FOLLOWUP_PREFETCH_EXPIRY_S:
+            return False
+        logger.info(
+            "Tool follow-up prefetch unclaimed after %.1fs; discarding (session %s)",
+            age,
+            conn_id,
+        )
+        self.response.discard_tool_followup_prefetch(conn_id, origin_response_key=st.tool_followup_prefetch_origin_response_key)
+        return True
 
     def handle_conversation_item_create(self, conn_id: str, event: ConversationItemCreateEvent) -> list[ServerEvent]:
         if self._state(conn_id).tool_followup_prefetch_request is not None:

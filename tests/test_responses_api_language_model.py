@@ -28,7 +28,14 @@ from openai.types.responses.response_output_text import ResponseOutputText
 
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_openai_compatible_language_model
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
-from speech_to_speech.LLM.base_openai_compatible_language_model import WARMUP_MAX_RETRIES, ToolCall, Usage
+from speech_to_speech.LLM.base_openai_compatible_language_model import (
+    WARMUP_MAX_RETRIES,
+    TextDelta,
+    ToolCall,
+    ToolCallProgress,
+    ToolCallStarted,
+    Usage,
+)
 from speech_to_speech.LLM.chat import (
     AUDIO_INPUT_HISTORY_PLACEHOLDER,
     Chat,
@@ -776,6 +783,67 @@ def test_single_sentence_message_flushes_before_tool_progress_streaming():
         part for chunk in chunks for part in chunk.parts if isinstance(part, AssistantToolCallProgressPart)
     ]
     assert [part.delta for part in progress_parts] == ['{"ti']
+    tool_chunks = [chunk for chunk in chunks if chunk.tools]
+    assert len(tool_chunks) == 1
+    assert progress_parts[0].item_id == tool_chunks[0].tools[0].id
+    assert progress_parts[0].call_id == tool_chunks[0].tools[0].call_id
+
+
+def test_iter_stream_events_yields_tool_call_started_when_call_starts():
+    handler = _make_handler()
+
+    stream = _make_stream(
+        [
+            _make_text_delta_event("Je vous sors la recette."),
+            _make_function_call_added_event(name="show_document", item_id="fc_1"),
+            _make_function_call_arguments_delta_event(delta='{"ti', item_id="fc_1"),
+        ]
+    )
+
+    events = list(handler._iter_stream_events(stream))
+
+    # The added frame is the first reliable signal that a call starts: providers
+    # like llama.cpp deliver the item-done frames only in a final batch, far too
+    # late to release the lead-in text.
+    assert isinstance(events[0], TextDelta)
+    assert events[0].text == "Je vous sors la recette."
+    assert isinstance(events[1], ToolCallStarted)
+    assert isinstance(events[2], ToolCallProgress)
+    assert events[2].delta == '{"ti'
+
+
+def test_lead_in_flushes_when_function_call_starts_before_message_done():
+    handler = _make_handler()
+    handler.stream_batch_sentences = 3
+
+    streamed_events = [
+        _make_text_delta_event("Je vous sors la recette."),
+        _make_function_call_added_event(name="show_document", item_id="fc_1"),
+        _make_function_call_arguments_delta_event(delta='{"ti', item_id="fc_1"),
+        # Item-done frames arrive in the final batch, after the whole argument
+        # stream — the old code waited for the message one to release the text.
+        _make_message_done_event("Je vous sors la recette."),
+        _make_function_call_done_event(name="show_document", arguments='{"title": "T"}', item_id="fc_1"),
+    ]
+
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _make_stream(streamed_events),
+        )
+    )
+
+    outputs = list(handler.process(_make_request("montre moi une recette")))
+
+    chunks = [output for output in outputs if isinstance(output, LLMResponseChunk)]
+    # The lead-in is released as soon as the call starts: before the first
+    # argument delta and long before the message-done frame.
+    assert chunks[0].text == "Je vous sors la recette."
+    progress_parts = [
+        part for chunk in chunks for part in chunk.parts if isinstance(part, AssistantToolCallProgressPart)
+    ]
+    assert [part.delta for part in progress_parts] == ['{"ti']
+    # The late message-done must not release the lead-in a second time.
+    assert [chunk.text for chunk in chunks if chunk.text] == ["Je vous sors la recette."]
     tool_chunks = [chunk for chunk in chunks if chunk.tools]
     assert len(tool_chunks) == 1
     assert progress_parts[0].item_id == tool_chunks[0].tools[0].id

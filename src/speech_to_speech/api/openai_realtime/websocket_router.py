@@ -15,6 +15,7 @@ from openai.types.realtime import (
     InputAudioBufferAppendEvent,
     InputAudioBufferCommitEvent,
     OutputAudioBufferClearEvent,
+    RealtimeConversationItemFunctionCallOutput,
     ResponseCancelEvent,
     ResponseCreateEvent,
     SessionUpdateEvent,
@@ -457,6 +458,12 @@ async def _dispatch_client_event(
             await send_correlated([service.build_session_updated(session_id)])
 
     elif isinstance(event, ConversationItemCreateEvent):
+        if isinstance(event.item, RealtimeConversationItemFunctionCallOutput):
+            logger.info(
+                "Client event: function_call_output (call_id=%s, session %s)",
+                event.item.call_id,
+                session_id,
+            )
         events = service.handle_conversation_item_create(session_id, event)
         if events:
             await send_correlated(events)
@@ -470,6 +477,11 @@ async def _dispatch_client_event(
         logger.debug("Accepted conversation.item.truncate for %s", event.item_id)
 
     elif isinstance(event, ResponseCreateEvent):
+        logger.info(
+            "Client event: response.create (event_id=%s, session %s)",
+            client_event_id,
+            session_id,
+        )
         result = service.handle_response_create(session_id, event)
         if result:
             response_key = None
@@ -1080,6 +1092,19 @@ def create_app(
                         )
                 except Empty:
                     pass
+
+                # Expire a speculative tool follow-up the client never adopted
+                # (no response.create), so the turn always comes back. Runs on
+                # both transports; throttled to keep the hot path cheap.
+                if (
+                    session is not None
+                    and session_id is not None
+                    and time.monotonic() - unit.prefetch_expiry_check_at >= 0.25
+                ):
+                    unit.prefetch_expiry_check_at = time.monotonic()
+                    if unit.service.expire_tool_followup_prefetch(session_id):
+                        unit.should_listen.set()
+                        logger.info(f"Pipeline {unit.index}: unclaimed tool follow-up expired, listening re-enabled")
 
                 await asyncio.sleep(0.01)
 

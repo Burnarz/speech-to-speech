@@ -27,6 +27,7 @@ from speech_to_speech.LLM.base_openai_compatible_language_model import (
     TextDelta,
     ToolCall,
     ToolCallProgress,
+    ToolCallStarted,
     Usage,
 )
 from speech_to_speech.LLM.chat import Chat
@@ -201,6 +202,9 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
                 item = raw_event.item
                 if isinstance(item, ResponseFunctionToolCall):
                     _normalize_fc(item)
+                    # First sight of the call: let the consumer release any
+                    # pending lead-in text before the argument stream starts.
+                    yield ToolCallStarted()
             elif isinstance(raw_event, ResponseFunctionCallArgumentsDeltaEvent):
                 if not raw_event.delta:
                     continue
