@@ -1195,9 +1195,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         )
         yield from self._generate(active_chat, original_chat, turn, optional_kwargs)
 
-    @property
-    def timing_log_level(self) -> int:
-        return logging.INFO
-
     def should_log_timing(self, output: LLMOut) -> bool:
+        # Per-chunk timing stays at the base DEBUG level: at INFO it spams
+        # one line per streamed chunk. Generation boundaries remain visible
+        # via the token-usage and response-done logs.
         return isinstance(output, LLMResponseChunk) and self.last_time > self.min_time_to_debug

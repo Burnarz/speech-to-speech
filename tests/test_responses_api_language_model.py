@@ -1106,7 +1106,8 @@ def test_responses_api_timing_logs_only_text_chunks():
     handler = object.__new__(ResponsesApiModelHandler)
     handler._times = [0.01]
 
-    assert handler.timing_log_level == logging.INFO
+    # Per-chunk timing is DEBUG (INFO spammed one line per streamed chunk).
+    assert handler.timing_log_level == logging.DEBUG
     assert handler.should_log_timing(LLMResponseChunk(text="Hello."))
     assert not handler.should_log_timing(TokenUsage(input_tokens=1, output_tokens=1))
     assert not handler.should_log_timing(EndOfResponse())

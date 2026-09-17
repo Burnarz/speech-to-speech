@@ -214,7 +214,7 @@ def _diag_log_sent_events(
     source_key: str | None,
     events: list[Any],
 ) -> None:
-    """[diag] Trace the response lifecycle events the client actually receives."""
+    """Trace the response lifecycle events the client actually receives (debug)."""
     if not events or session_id is None:
         return
     st = unit.service._state(session_id)
@@ -224,8 +224,8 @@ def _diag_log_sent_events(
         if etype not in ("response.created", "response.done", "error"):
             continue
         if etype == "error":
-            logger.info(
-                "[diag] -> client: error session=%s error_type=%s message=%r event_id=%s",
+            logger.debug(
+                "-> client: error session=%s error_type=%s message=%r event_id=%s",
                 session_id,
                 getattr(event.error, "type", None),
                 getattr(event.error, "message", None),
@@ -233,8 +233,8 @@ def _diag_log_sent_events(
             )
             continue
         response = getattr(event, "response", None)
-        logger.info(
-            "[diag] -> client: %s session=%s resp_id=%s status=%s source_key=%s prefetch_key=%s in_response=%s created_pending_key=%s",
+        logger.debug(
+            "-> client: %s session=%s resp_id=%s status=%s source_key=%s prefetch_key=%s in_response=%s created_pending_key=%s",
             etype,
             session_id,
             getattr(response, "id", None),

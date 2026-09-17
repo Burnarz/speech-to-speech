@@ -184,8 +184,8 @@ class ResponseHandler(RealtimeBaseHandler):
             or st.runtime_config.chat.has_pending_tool_calls()
         ):
             if st.generation_done_tool_calls:
-                logger.info(
-                    "[diag] tool follow-up prefetch blocked session=%s prefetch_exists=%s deferred=%d pending_tool_calls=%s",
+                logger.debug(
+                    "tool follow-up prefetch blocked session=%s prefetch_exists=%s deferred=%d pending_tool_calls=%s",
                     conn_id,
                     st.tool_followup_prefetch_request is not None,
                     len(st.deferred_items),
@@ -336,8 +336,8 @@ class ResponseHandler(RealtimeBaseHandler):
         if event.response_key in st.closed_response_keys:
             if event.response_key not in st.completed_tool_response_keys:
                 if event.call_ids:
-                    logger.info(
-                        "[diag] generation done ignored (key closed) session=%s response_key=%s call_ids=%s",
+                    logger.debug(
+                        "generation done ignored (key closed) session=%s response_key=%s call_ids=%s",
                         conn_id,
                         event.response_key,
                         sorted(event.call_ids),
@@ -375,8 +375,8 @@ class ResponseHandler(RealtimeBaseHandler):
             st.generation_done_tool_calls[event.response_key] = set(event.call_ids)
             while len(st.generation_done_tool_calls) > 128:
                 st.generation_done_tool_calls.pop(next(iter(st.generation_done_tool_calls)))
-            logger.info(
-                "[diag] generation done with tool calls session=%s response_key=%s call_ids=%s",
+            logger.debug(
+                "generation done with tool calls session=%s response_key=%s call_ids=%s",
                 conn_id,
                 event.response_key,
                 sorted(event.call_ids),
@@ -742,8 +742,8 @@ class ResponseHandler(RealtimeBaseHandler):
         """
         st = self._state(conn_id)
         incoming_prefetch = st.tool_followup_prefetch_request
-        logger.info(
-            "[diag] response.create session=%s in_response=%s response_pending=%s pending_keys=%s prefetch_key=%s pending_tool_calls=%s deferred=%d",
+        logger.debug(
+            "response.create session=%s in_response=%s response_pending=%s pending_keys=%s prefetch_key=%s pending_tool_calls=%s deferred=%d",
             conn_id,
             st.in_response,
             st.response_pending,
@@ -764,16 +764,16 @@ class ResponseHandler(RealtimeBaseHandler):
                 claimed = self._claim_tool_followup_prefetch(conn_id, event)
                 if claimed is not None:
                     return claimed
-                logger.info(
-                    "[diag] response.create prefetch claim failed, falling through session=%s prefetch_key=%s",
+                logger.debug(
+                    "response.create prefetch claim failed, falling through session=%s prefetch_key=%s",
                     conn_id,
                     prefetch_request.response_key,
                 )
                 prefetch_request = None
         replacing_prefetch = prefetch_request is not None
         if st.in_response or (st.response_pending and not replacing_prefetch):
-            logger.info(
-                "[diag] response.create REJECTED active/pending session=%s in_response=%s response_pending=%s current_key=%s pending_keys=%s replacing_prefetch=%s",
+            logger.debug(
+                "response.create REJECTED active/pending session=%s in_response=%s response_pending=%s current_key=%s pending_keys=%s replacing_prefetch=%s",
                 conn_id,
                 st.in_response,
                 st.response_pending,
@@ -805,8 +805,8 @@ class ResponseHandler(RealtimeBaseHandler):
             except ChatItemError as exc:
                 return self.make_error(message=str(exc), _type="invalid_input_item")
             if candidate_chat.has_pending_tool_calls():
-                logger.info(
-                    "[diag] response.create REJECTED pending tool calls session=%s pending_keys=%s",
+                logger.debug(
+                    "response.create REJECTED pending tool calls session=%s pending_keys=%s",
                     conn_id,
                     sorted(st.pending_response_keys),
                 )
@@ -824,8 +824,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.generation_done_tool_calls.pop(origin_response_key, None)
                 st.completed_tool_response_keys.pop(origin_response_key, None)
             if st.response_pending:
-                logger.info(
-                    "[diag] response.create REJECTED pending after replacement session=%s pending_keys=%s",
+                logger.debug(
+                    "response.create REJECTED pending after replacement session=%s pending_keys=%s",
                     conn_id,
                     sorted(st.pending_response_keys),
                 )
@@ -1027,7 +1027,7 @@ class ResponseHandler(RealtimeBaseHandler):
             # side-channel part must not reopen it: that would emit
             # response.created with no matching response.done and wedge
             # client and server state (stuck orb, unclaimable prefetch).
-            logger.info(
+            logger.debug(
                 "Ignoring assistant output for closed response %s",
                 event.response_key,
             )
@@ -1228,7 +1228,7 @@ class ResponseHandler(RealtimeBaseHandler):
             # Same straggler rule as on_assistant_output: progress for a
             # closed response is noise — the final arguments were already
             # delivered — and must not reopen the response.
-            logger.info(
+            logger.debug(
                 "Ignoring tool call progress for closed response %s",
                 event.response_key,
             )
@@ -1345,7 +1345,7 @@ class ResponseHandler(RealtimeBaseHandler):
             # side channel can trail it when backlogged; resurrecting a
             # response here would emit a response.created with no matching
             # response.done and wedge both server and client state.
-            logger.info(
+            logger.debug(
                 "Ignoring assistant completion for closed response %s",
                 event.response_key,
             )
