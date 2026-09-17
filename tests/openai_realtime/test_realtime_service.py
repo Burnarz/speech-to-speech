@@ -58,6 +58,7 @@ from speech_to_speech.api.openai_realtime.service import (
 from speech_to_speech.pipeline.events import (
     AssistantOutputEvent,
     AssistantResponseDoneEvent,
+    AssistantToolCallProgressEvent,
     AssistantToolCallReadyEvent,
     AudioInputCompletedEvent,
     PartialTranscriptionEvent,
@@ -1806,6 +1807,72 @@ class TestHandleResponseCreate:
         assert isinstance(created[0], ResponseCreatedEvent)
         assert state.response_pending is False
         assert state.pending_response_keys == set()
+
+    def test_late_assistant_response_done_for_closed_key_creates_no_response(self, service, conn_id):
+        service.response._ensure_response(conn_id, "response_closed")
+        done = service.finish_response(conn_id, response_key="response_closed")
+        assert any(isinstance(event, ResponseDoneEvent) for event in done)
+        state = service._state(conn_id)
+        assert "response_closed" in state.closed_response_keys
+
+        events = service.response.on_assistant_response_done(
+            conn_id,
+            AssistantResponseDoneEvent(response_key="response_closed"),
+        )
+
+        assert events == []
+        assert state.in_response is False
+        assert state.current_response_id is None
+        assert state.current_response_key is None
+
+    def test_late_assistant_output_for_closed_key_creates_no_response(self, service, conn_id):
+        service.response._ensure_response(conn_id, "response_closed")
+        done = service.finish_response(conn_id, response_key="response_closed")
+        assert any(isinstance(event, ResponseDoneEvent) for event in done)
+        state = service._state(conn_id)
+        assert "response_closed" in state.closed_response_keys
+
+        events = service.response.on_assistant_output(
+            conn_id,
+            AssistantOutputEvent(
+                response_key="response_closed",
+                tools=[
+                    {
+                        "type": "function_call",
+                        "id": "item_late",
+                        "call_id": "call_late",
+                        "name": "get_joke",
+                        "arguments": "{}",
+                    }
+                ],
+            ),
+        )
+
+        assert events == []
+        assert state.in_response is False
+        assert state.current_response_id is None
+        assert state.current_response_key is None
+
+    def test_late_tool_call_progress_for_closed_key_creates_no_response(self, service, conn_id):
+        service.response._ensure_response(conn_id, "response_closed")
+        service.finish_response(conn_id, response_key="response_closed")
+        state = service._state(conn_id)
+        assert "response_closed" in state.closed_response_keys
+
+        events = service.response.on_assistant_tool_call_progress(
+            conn_id,
+            AssistantToolCallProgressEvent(
+                response_key="response_closed",
+                name="get_joke",
+                call_id="call_late",
+                delta="{}",
+            ),
+        )
+
+        assert events == []
+        assert state.in_response is False
+        assert state.current_response_id is None
+        assert state.current_response_key is None
 
     def test_response_create_stores_overrides(self, service, conn_id, runtime_config, text_prompt_queue):
         evt = ResponseCreateEvent(

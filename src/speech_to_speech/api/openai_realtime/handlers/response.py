@@ -183,6 +183,14 @@ class ResponseHandler(RealtimeBaseHandler):
             or st.deferred_items
             or st.runtime_config.chat.has_pending_tool_calls()
         ):
+            if st.generation_done_tool_calls:
+                logger.info(
+                    "[diag] tool follow-up prefetch blocked session=%s prefetch_exists=%s deferred=%d pending_tool_calls=%s",
+                    conn_id,
+                    st.tool_followup_prefetch_request is not None,
+                    len(st.deferred_items),
+                    st.runtime_config.chat.has_pending_tool_calls(),
+                )
             return False
 
         origin_response_key = next(
@@ -327,6 +335,13 @@ class ResponseHandler(RealtimeBaseHandler):
             return []
         if event.response_key in st.closed_response_keys:
             if event.response_key not in st.completed_tool_response_keys:
+                if event.call_ids:
+                    logger.info(
+                        "[diag] generation done ignored (key closed) session=%s response_key=%s call_ids=%s",
+                        conn_id,
+                        event.response_key,
+                        sorted(event.call_ids),
+                    )
                 return []
             st.completed_tool_response_keys.pop(event.response_key, None)
         if st.in_response and st.current_response_key not in (None, event.response_key):
@@ -360,6 +375,12 @@ class ResponseHandler(RealtimeBaseHandler):
             st.generation_done_tool_calls[event.response_key] = set(event.call_ids)
             while len(st.generation_done_tool_calls) > 128:
                 st.generation_done_tool_calls.pop(next(iter(st.generation_done_tool_calls)))
+            logger.info(
+                "[diag] generation done with tool calls session=%s response_key=%s call_ids=%s",
+                conn_id,
+                event.response_key,
+                sorted(event.call_ids),
+            )
             self.maybe_start_tool_followup_prefetch(conn_id)
         return events
 
@@ -720,6 +741,17 @@ class ResponseHandler(RealtimeBaseHandler):
         on failure, or ``None`` if there is no text_prompt_queue.
         """
         st = self._state(conn_id)
+        incoming_prefetch = st.tool_followup_prefetch_request
+        logger.info(
+            "[diag] response.create session=%s in_response=%s response_pending=%s pending_keys=%s prefetch_key=%s pending_tool_calls=%s deferred=%d",
+            conn_id,
+            st.in_response,
+            st.response_pending,
+            sorted(st.pending_response_keys),
+            incoming_prefetch.response_key if incoming_prefetch is not None else None,
+            st.runtime_config.chat.has_pending_tool_calls(),
+            len(st.deferred_items),
+        )
         if event.response:
             if event.response.tool_choice and not isinstance(event.response.tool_choice, str):
                 return self.make_error(
@@ -732,9 +764,23 @@ class ResponseHandler(RealtimeBaseHandler):
                 claimed = self._claim_tool_followup_prefetch(conn_id, event)
                 if claimed is not None:
                     return claimed
+                logger.info(
+                    "[diag] response.create prefetch claim failed, falling through session=%s prefetch_key=%s",
+                    conn_id,
+                    prefetch_request.response_key,
+                )
                 prefetch_request = None
         replacing_prefetch = prefetch_request is not None
         if st.in_response or (st.response_pending and not replacing_prefetch):
+            logger.info(
+                "[diag] response.create REJECTED active/pending session=%s in_response=%s response_pending=%s current_key=%s pending_keys=%s replacing_prefetch=%s",
+                conn_id,
+                st.in_response,
+                st.response_pending,
+                st.current_response_key,
+                sorted(st.pending_response_keys),
+                replacing_prefetch,
+            )
             return self.make_error(
                 message="Cannot create response while another response is in progress or pending.",
                 _type="conversation_already_has_active_response",
@@ -759,6 +805,11 @@ class ResponseHandler(RealtimeBaseHandler):
             except ChatItemError as exc:
                 return self.make_error(message=str(exc), _type="invalid_input_item")
             if candidate_chat.has_pending_tool_calls():
+                logger.info(
+                    "[diag] response.create REJECTED pending tool calls session=%s pending_keys=%s",
+                    conn_id,
+                    sorted(st.pending_response_keys),
+                )
                 return self.make_error(
                     message="Cannot create a response while function call outputs are pending.",
                     _type="function_call_output_pending",
@@ -773,6 +824,11 @@ class ResponseHandler(RealtimeBaseHandler):
                 st.generation_done_tool_calls.pop(origin_response_key, None)
                 st.completed_tool_response_keys.pop(origin_response_key, None)
             if st.response_pending:
+                logger.info(
+                    "[diag] response.create REJECTED pending after replacement session=%s pending_keys=%s",
+                    conn_id,
+                    sorted(st.pending_response_keys),
+                )
                 return self.make_error(
                     message="Cannot create response while another response is pending.",
                     _type="conversation_already_has_active_response",
@@ -966,6 +1022,16 @@ class ResponseHandler(RealtimeBaseHandler):
                 logger.debug("Dropping stale assistant output for turn=%s rev=%s", event.turn_id, event.turn_revision)
                 return []
         st = self._state(conn_id)
+        if event.response_key in st.closed_response_keys:
+            # The ordered terminal already closed this response. A straggler
+            # side-channel part must not reopen it: that would emit
+            # response.created with no matching response.done and wedge
+            # client and server state (stuck orb, unclaimable prefetch).
+            logger.info(
+                "Ignoring assistant output for closed response %s",
+                event.response_key,
+            )
+            return []
         events: list[ServerEvent] = []
         output_sequence = event.output_sequence
         if output_sequence is not None:
@@ -1158,6 +1224,15 @@ class ResponseHandler(RealtimeBaseHandler):
         reservation invents one.
         """
         st = self._state(conn_id)
+        if event.response_key in st.closed_response_keys:
+            # Same straggler rule as on_assistant_output: progress for a
+            # closed response is noise — the final arguments were already
+            # delivered — and must not reopen the response.
+            logger.info(
+                "Ignoring tool call progress for closed response %s",
+                event.response_key,
+            )
+            return []
         response_was_missing = st.current_response_id is None
         resp_id, _ = self._ensure_response(conn_id, event.response_key)
         events: list[ServerEvent] = []
@@ -1264,6 +1339,17 @@ class ResponseHandler(RealtimeBaseHandler):
     ) -> list[ServerEvent]:
         """Record that all ordered text/tool output for one response was emitted."""
         st = self._state(conn_id)
+        if event.response_key in st.closed_response_keys:
+            # The ordered terminal (audio sentinel) already closed this
+            # response and its usage was settled by close_response_key. The
+            # side channel can trail it when backlogged; resurrecting a
+            # response here would emit a response.created with no matching
+            # response.done and wedge both server and client state.
+            logger.info(
+                "Ignoring assistant completion for closed response %s",
+                event.response_key,
+            )
+            return []
         response_was_missing = st.current_response_id is None
         self._ensure_response(conn_id, event.response_key)
         events = self.finish_audio_output(conn_id, event.response_key)

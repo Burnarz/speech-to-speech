@@ -176,11 +176,74 @@ def _response_key_output_is_blocked(
     return unit.service.response.is_response_output_blocked(session_id, response_key)
 
 
+def _side_channel_has_response_key(
+    unit: PipelineUnit,
+    session: SessionState | None,
+    response_key: str | None,
+) -> bool:
+    """Whether undelivered side-channel events still exist for *response_key*.
+
+    The ordered audio terminal must not overtake assistant output (tool
+    calls, transcript, usage, logical completion) still waiting in the side
+    channel: finishing first would close the response while its own output
+    is still queued, and that late output would then resurrect the response
+    (a response.created with no matching response.done) or be dropped.
+    Callers hold the terminal until this returns False; side-channel items
+    for other keys are unaffected.
+    """
+    if response_key is None or session is None:
+        return False
+    for pending in session.pending_text_output_items:
+        if _output_response_key(pending) == response_key:
+            return True
+    queue = unit.text_output_queue
+    with queue.mutex:
+        return any(_output_response_key(item) == response_key for item in queue.queue)
+
+
 def _discard_obsolete_response_key(unit: PipelineUnit, session_id: str, response_key: str | None) -> None:
     if response_key is None:
         return
     unit.service.close_response_key(session_id, response_key)
     logger.debug("Pipeline %d: discarded obsolete response %s output", unit.index, response_key)
+
+
+def _diag_log_sent_events(
+    unit: PipelineUnit,
+    session_id: str | None,
+    source_key: str | None,
+    events: list[Any],
+) -> None:
+    """[diag] Trace the response lifecycle events the client actually receives."""
+    if not events or session_id is None:
+        return
+    st = unit.service._state(session_id)
+    prefetch_request = st.tool_followup_prefetch_request
+    for event in events:
+        etype = getattr(event, "type", None)
+        if etype not in ("response.created", "response.done", "error"):
+            continue
+        if etype == "error":
+            logger.info(
+                "[diag] -> client: error session=%s error_type=%s message=%r event_id=%s",
+                session_id,
+                getattr(event.error, "type", None),
+                getattr(event.error, "message", None),
+                getattr(event, "event_id", None),
+            )
+            continue
+        response = getattr(event, "response", None)
+        logger.info(
+            "[diag] -> client: %s session=%s resp_id=%s status=%s source_key=%s prefetch_key=%s in_response=%s created_pending_key=%s",
+            etype,
+            session_id,
+            getattr(response, "id", None),
+            getattr(response, "status", None),
+            source_key,
+            prefetch_request.response_key if prefetch_request is not None else None,
+            st.in_response,
+            st.response_created_pending_key,
+        )
 
 
 def _flush_queue(
@@ -488,6 +551,7 @@ async def _dispatch_client_event(
             if result.type != "error":
                 unit.cancel_scope.new_response()
                 response_key = service._state(session_id).current_response_key
+            _diag_log_sent_events(unit, session_id, response_key, [result])
             await send_correlated([result])
             if result.type == "response.created":
                 service.response.mark_response_created_sent(session_id, response_key)
@@ -886,6 +950,7 @@ def create_app(
 
                     if transport is not None and isinstance(text_msg, PipelineEvent) and session_id:
                         events = unit.service.dispatch_pipeline_event(session_id, text_msg)
+                        _diag_log_sent_events(unit, session_id, _output_response_key(text_msg), events)
                         if events:
                             await transport.send_events(events)
 
@@ -960,12 +1025,16 @@ def create_app(
                             _discard_obsolete_response_key(unit, session_id, response_key)
                             continue
                         if transport is not None and session_id is not None:
-                            await transport.send_events(unit.service.dispatch_pipeline_event(session_id, audio_chunk))
+                            events = unit.service.dispatch_pipeline_event(session_id, audio_chunk)
+                            _diag_log_sent_events(unit, session_id, response_key, events)
+                            await transport.send_events(events)
                         continue
 
                     if _is_pipeline_end(audio_chunk):
                         if transport is not None and session_id:
-                            await transport.send_events(unit.service.finish_response(session_id))
+                            events = unit.service.finish_response(session_id)
+                            _diag_log_sent_events(unit, session_id, None, events)
+                            await transport.send_events(events)
                         break
 
                     if _is_audio_done(audio_chunk):
@@ -985,6 +1054,7 @@ def create_app(
                                         status="cancelled",
                                         response_key=response_key,
                                     )
+                                    _diag_log_sent_events(unit, session_id, response_key, events)
                                     if transport is not None and events:
                                         await transport.send_events(events)
                                 else:
@@ -1009,10 +1079,19 @@ def create_app(
                         if session_id is not None and _response_key_is_obsolete(unit, session_id, response_key):
                             _discard_obsolete_response_key(unit, session_id, response_key)
                             continue
+                        if session is not None and _side_channel_has_response_key(unit, session, response_key):
+                            # Assistant output for this response is still
+                            # queued behind its own audio sentinel (e.g. a
+                            # tool call trailing the terminal). Hold the
+                            # sentinel one iteration so finish_response()
+                            # always closes a fully delivered response.
+                            session.pending_output_item = audio_chunk
+                            await asyncio.sleep(0.01)
+                            continue
                         if transport is not None and session_id:
-                            await transport.send_events(
-                                unit.service.finish_response(session_id, response_key=response_key)
-                            )
+                            events = unit.service.finish_response(session_id, response_key=response_key)
+                            _diag_log_sent_events(unit, session_id, response_key, events)
+                            await transport.send_events(events)
                         if session_id:
                             unit.service._state(session_id).clear_pending_response(response_key)
                         unit.response_playing.clear()
