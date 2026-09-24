@@ -376,7 +376,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # Preserve the incomplete block until more streamed text arrives.
                 # Stream the growing block on the side channel so document-style
                 # tools can render before the call is complete and parseable.
-                inner = code_and_after[len(ctx.enter_code):]
+                inner = code_and_after[len(ctx.enter_code) :]
                 if inner:
                     prev = ctx.tool_call_progress_sent
                     if prev == 0 or len(inner) - prev >= TOOL_CALL_PROGRESS_MIN_CHARS:

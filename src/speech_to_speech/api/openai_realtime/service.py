@@ -531,7 +531,9 @@ class RealtimeService:
             age,
             conn_id,
         )
-        self.response.discard_tool_followup_prefetch(conn_id, origin_response_key=st.tool_followup_prefetch_origin_response_key)
+        self.response.discard_tool_followup_prefetch(
+            conn_id, origin_response_key=st.tool_followup_prefetch_origin_response_key
+        )
         return True
 
     def handle_conversation_item_create(self, conn_id: str, event: ConversationItemCreateEvent) -> list[ServerEvent]:

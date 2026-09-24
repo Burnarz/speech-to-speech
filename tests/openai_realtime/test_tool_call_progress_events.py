@@ -213,14 +213,10 @@ def test_progress_with_early_side_channel_does_not_duplicate_items(service, conn
     added = [event for event in standard if event.type == "response.output_item.added"]
     args_done = [event for event in standard if event.type == "response.function_call_arguments.done"]
     item_done = [event for event in standard if event.type == "response.output_item.done"]
-    function_items = [
-        event for event in added if event.item.type == "function_call"
-    ]
+    function_items = [event for event in added if event.item.type == "function_call"]
     assert len(function_items) == 1, "the tool call must be exposed exactly once"
     assert len(args_done) == 1
-    function_item_dones = [
-        event for event in item_done if event.item.id == function_items[0].item.id
-    ]
+    function_item_dones = [event for event in item_done if event.item.id == function_items[0].item.id]
     assert len(function_item_dones) == 1
 
     assert progress[0].item_id == function_items[0].item.id
