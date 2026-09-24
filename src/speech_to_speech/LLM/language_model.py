@@ -482,6 +482,9 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             text_parts.clear()
 
         for part in parts:
+            if isinstance(part, AssistantToolCallProgressPart):
+                # Side-channel only: never part of the committed ordered output.
+                continue
             if isinstance(part, AssistantTextPart):
                 text_parts.append(part.text)
                 continue

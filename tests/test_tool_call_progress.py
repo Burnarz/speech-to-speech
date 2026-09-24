@@ -1,17 +1,22 @@
 """Tests for streaming tool-call progress while the code block is open.
 
-Covers the two layers that produce and route progress:
+Covers the layers that produce, route, and commit progress:
 
 * ``BaseLanguageModelHandler._process_printable_text`` emits
   ``AssistantToolCallProgressPart`` chunks while a ``<code>`` block is still
   incomplete, throttled to bounded deltas.
 * ``LMOutputProcessor`` routes those parts to the side channel only (no TTS,
   no ordered assistant output, no chat history).
+* ``LanguageModelHandler._commit_ordered_output`` skips side-channel progress
+  parts so chat history only ever records text and tool calls.
 """
 
 import json
 from queue import Queue
 
+from openai.types.responses import ResponseFunctionToolCall
+
+from speech_to_speech.LLM.chat import Chat, make_user_message
 from speech_to_speech.LLM.language_model import (
     TOOL_CALL_PROGRESS_MIN_CHARS,
     LanguageModelHandler,
@@ -22,6 +27,8 @@ from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
 from speech_to_speech.LLM.tool_call.tool_prompt import END_CODE, ENTER_CODE, build_block_regex
 from speech_to_speech.pipeline.events import AssistantToolCallProgressEvent
 from speech_to_speech.pipeline.messages import (
+    AssistantTextPart,
+    AssistantToolCallPart,
     AssistantToolCallProgressPart,
     LLMResponseChunk,
 )
@@ -169,3 +176,30 @@ def test_lm_processor_routes_progress_to_side_channel_only():
     assert event.turn_id == "turn_1"
     assert event.turn_revision == 2
     assert side.empty()
+
+
+def test_commit_ordered_output_skips_side_channel_progress_parts():
+    chat = Chat(5)
+    chat.add_item(make_user_message("go"))
+    tool_call = ResponseFunctionToolCall(
+        type="function_call",
+        id="fc_doc",
+        call_id="call_doc",
+        name="show_document",
+        arguments="{}",
+    )
+    parts = [
+        AssistantTextPart(text="before"),
+        AssistantToolCallProgressPart(name="show_document", delta="partial"),
+        AssistantTextPart(text="lead in"),
+        AssistantToolCallPart(tool=tool_call),
+    ]
+
+    committed = LanguageModelHandler._commit_ordered_output(chat, parts, wants_audio=True)
+
+    assert committed
+    output = chat.buffer[1:]
+    assert [item.type for item in output] == ["message", "function_call"]
+    assert output[0].content[0].text == "before lead in"
+    assert output[1].name == "show_document"
+    assert output[1].call_id == "call_doc"
