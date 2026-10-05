@@ -53,6 +53,14 @@ dependencies = [
     "websockets>=12.0",
     "nano-parakeet>=0.2.0; platform_system != 'Darwin'",
     "faster-qwen3-tts[ggml]>=0.4.0; platform_system != 'Darwin' and platform_system != 'Windows'",
+    # le TTS GGML (qwentts_cpp, déps de faster-qwen3-tts[ggml]) est compilé
+    # CUDA 12.8 : il dlopens libcudart.so.12 + libcublas.so.12 — la stack cu13
+    # (torch) ne les fournit pas. Garder le runtime cu12 dans le venv (26/09 :
+    # crash au montage "libcudart.so.12: cannot open shared object file" après
+    # la migration CUDA 12→13 de la machine). Les deux runtimes coexistent
+    # (SONAMEs distinctes) ; le daemon expose ces lib/ en LD_LIBRARY_PATH.
+    "nvidia-cuda-runtime-cu12; platform_system != 'Darwin' and platform_system != 'Windows'",
+    "nvidia-cublas-cu12; platform_system != 'Darwin' and platform_system != 'Windows'",
     "faster-qwen3-tts>=0.4.0; platform_system == 'Windows'",
     "librosa==0.11.0",
     "lingua-language-detector>=2.0.2",
